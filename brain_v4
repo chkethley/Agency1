@@ -1,0 +1,39 @@
+# brain_v4.py
+import os
+import argparse
+import json
+import logging
+from core.memory import EnhancedHippocampus
+from core.processing import NeuralProcessor
+from interfaces.cli import CLIInterface
+from utils.metadata_manager import MetadataManager
+
+def load_config(config_path):
+    with open(config_path, 'r') as f:
+        return json.load(f)
+
+def main():
+    parser = argparse.ArgumentParser(description='Brain V4 - Advanced Neural Processing System')
+    parser.add_argument('--config', default='config/default_config.json', help='Path to configuration file')
+    args = parser.parse_args()
+    
+    # Load configuration
+    config = load_config(args.config)
+    
+    # Setup logging
+    logging.basicConfig(
+        level=getattr(logging, config.get('log_level', 'INFO')),
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    
+    # Initialize components
+    memory = EnhancedHippocampus(config.get('memory', {}))
+    processor = NeuralProcessor(config.get('processor', {}), memory)
+    metadata = MetadataManager(config.get('metadata', {}))
+    
+    # Start CLI interface
+    cli = CLIInterface(processor, memory, metadata)
+    cli.start()
+
+if __name__ == "__main__":
+    main()
