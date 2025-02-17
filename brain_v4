@@ -1,3 +1,4 @@
+# config/__init__.py
 # brain_v4.py
 import os
 import argparse
