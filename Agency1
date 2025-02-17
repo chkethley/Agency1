@@ -1,0 +1,31 @@
+Agency1/
+├── __init__.py
+├── main.py
+├── setup.py
+├── README.md
+├── requirements.txt
+├── brain_v4/
+│   ├── __init__.py
+│   ├── brain_v4.py
+│   ├── config/
+│   │   ├── __init__.py
+│   │   ├── default_config.json
+│   │   └── system_prompt.md
+│   ├── core/
+│   │   ├── __init__.py
+│   │   ├── memory.py
+│   │   ├── processing.py
+│   │   └── validation.py
+│   ├── interfaces/
+│   │   ├── __init__.py
+│   │   └── cli.py
+│   └── utils/
+│       ├── __init__.py
+│       └── metadata_manager.py
+├── integrations/
+│   ├── __init__.py
+│   ├── api_service.py
+│   └── storage_service.py
+└── docs/
+    ├── architecture.md
+    └── usage_guide.md
