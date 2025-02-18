@@ -1,0 +1,396 @@
+import json
+import time
+import hashlib
+import os
+import asyncio
+import logging
+from collections import deque
+from pathlib import Path
+from datetime import datetime
+from typing import Dict, Any, Optional, List, Tuple
+
+import numpy as np
+from sentence_transformers import SentenceTransformer
+
+# Transformers imports for LLM training and LLM interface
+from transformers import (
+    GPT2LMHeadModel,
+    GPT2Tokenizer,
+    Trainer,
+    TrainingArguments,
+    TextDataset,
+    DataCollatorForLanguageModeling,
+    pipeline  # For LLMInterface
+)
+
+# ------------------------------
+# Group 3: Memory (Short & Long Term Storage)
+# ------------------------------
+
+class Memory:
+    """
+    Memory module for short-term and long-term data storage with semantic search.
+    """
+    def __init__(self, config: Dict[str, Any]):
+        self.short_term = deque(maxlen=config.get('short_term_capacity', 200))
+        self.long_term: Dict[str, Any] = {}
+        self.persistence_file = config.get('persistence_file', 'memory/storage.json')
+        self.embedder = SentenceTransformer('all-MiniLM-L6-v2')
+        self._load_long_term()
+
+    def _generate_key(self, data: Any) -> str:
+        return hashlib.sha256(str(data).encode()).hexdigest()[:16]
+
+    def _compute_embedding(self, text: str) -> List[float]:
+        embedding = self.embedder.encode(text)
+        return embedding.tolist()
+
+    def store(self, data: Any, long_term: bool = False) -> str:
+        key = self._generate_key(data)
+        entry = {
+            "data": data,
+            "timestamp": time.time(),
+            "access_count": 0,
+        }
+        if isinstance(data, str):
+            entry["embedding"] = self._compute_embedding(data)
+        if long_term:
+            self.long_term[key] = entry
+            self._save_long_term()
+        else:
+            self.short_term.append((key, entry))
+        return key
+
+    def recall(self, key: str) -> Optional[Any]:
+        for k, entry in self.short_term:
+            if k == key:
+                return entry.get("data")
+        return self.long_term.get(key, {}).get("data")
+
+    def get_context(self, query: str, top_k: int = 3, similarity_threshold: float = 0.7) -> List[str]:
+        query_embedding = np.array(self.embedder.encode(query))
+        results: List[Tuple[float, str]] = []
+        # Search short-term memories
+        for key, entry in self.short_term:
+            data = entry.get("data")
+            if isinstance(data, str) and "embedding" in entry:
+                mem_embedding = np.array(entry["embedding"])
+                sim = self._cosine_similarity(query_embedding, mem_embedding)
+                if sim >= similarity_threshold:
+                    results.append((sim, data))
+        # Search long-term memories
+        for key, entry in self.long_term.items():
+            data = entry.get("data")
+            if isinstance(data, str) and "embedding" in entry:
+                mem_embedding = np.array(entry["embedding"])
+                sim = self._cosine_similarity(query_embedding, mem_embedding)
+                if sim >= similarity_threshold:
+                    results.append((sim, data))
+        results.sort(key=lambda x: x[0], reverse=True)
+        return [data for _, data in results[:top_k]]
+
+    def _cosine_similarity(self, vec_a: np.ndarray, vec_b: np.ndarray) -> float:
+        if np.linalg.norm(vec_a) == 0 or np.linalg.norm(vec_b) == 0:
+            return 0.0
+        return float(np.dot(vec_a, vec_b) / (np.linalg.norm(vec_a) * np.linalg.norm(vec_b)))
+
+    def feedback_memory(self, key: str, positive: bool):
+        """
+        Adjust a memory's access_count based on feedback.
+        Positive feedback boosts its significance.
+        """
+        for idx, (k, entry) in enumerate(self.short_term):
+            if k == key:
+                entry["access_count"] += 1 if positive else max(0, entry["access_count"] - 1)
+                self.short_term[idx] = (k, entry)
+                return
+        if key in self.long_term:
+            self.long_term[key]["access_count"] += 1 if positive else max(0, self.long_term[key]["access_count"] - 1)
+            self._save_long_term()
+
+    def consolidate(self):
+        """Move older memories to long-term storage."""
+        cutoff = time.time() - 3600  # 1 hour threshold
+        for item in list(self.short_term):
+            if item[1]["timestamp"] < cutoff:
+                self.store(item[1]["data"], long_term=True)
+                self.short_term.remove(item)
+
+    def _load_long_term(self):
+        try:
+            with open(self.persistence_file, 'r') as f:
+                self.long_term = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            self.long_term = {}
+
+    def _save_long_term(self):
+        temp_file = f"{self.persistence_file}.tmp"
+        with open(temp_file, 'w') as f:
+            json.dump(self.long_term, f)
+        os.replace(temp_file, self.persistence_file)
+
+# ------------------------------
+# Group 4: Messenger (Retrieval, Storage & Distribution of Memory)
+# ------------------------------
+
+class Messenger:
+    """
+    Messenger module handles logging interactions and distributing memory.
+    """
+    def __init__(self, config: Dict[str, Any]):
+        self.data_dir = Path(config.get('data_dir', 'data'))
+        self.interactions_file = self.data_dir / "interactions.jsonl"
+        self.knowledge_file = self.data_dir / "knowledge.json"
+        self._ensure_structure()
+
+    def _ensure_structure(self):
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        if not self.interactions_file.exists():
+            self.interactions_file.touch()
+        if not self.knowledge_file.exists():
+            self.knowledge_file.touch()
+
+    def log_interaction(self, input_data: str, output_data: str):
+        entry = {
+            "timestamp": datetime.now().isoformat(),
+            "input": input_data,
+            "output": output_data
+        }
+        with self.interactions_file.open('a') as f:
+            f.write(json.dumps(entry) + '\n')
+
+    def log_feedback(self, interaction_key: str, positive: bool):
+        current = self.load_knowledge()
+        feedback_val = "positive" if positive else "negative"
+        if interaction_key in current:
+            current[interaction_key]["feedback"] = feedback_val
+        else:
+            current[interaction_key] = {"feedback": feedback_val}
+        with self.knowledge_file.open('w') as f:
+            json.dump(current, f)
+
+    def load_knowledge(self) -> Dict[str, Any]:
+        try:
+            with self.knowledge_file.open('r') as f:
+                return json.load(f)
+        except json.JSONDecodeError:
+            return {}
+
+# ------------------------------
+# Group 2: NeuralNetwork (Internal Data Processing)
+# ------------------------------
+
+class NeuralNetwork:
+    """
+    Neural network for internal processing and refinement of data.
+    """
+    def __init__(self, memory: Memory):
+        self.memory = memory
+        self.model = self._build_model()
+        logging.info("NeuralNetwork initialized.")
+
+    def _build_model(self) -> Dict[str, Any]:
+        return {
+            "layers": [
+                {"type": "input", "nodes": 256, "activation": "relu"},
+                {"type": "lstm", "nodes": 128},
+                {"type": "attention", "heads": 4},
+                {"type": "dense", "nodes": 64, "activation": "sigmoid"}
+            ],
+            "learning_rate": 0.001
+        }
+
+    def refine_output(self, data: str) -> str:
+        # Use memory context to enhance output
+        context = self.memory.get_context(data)
+        return f"{data} [Enhanced with {len(context)} memory contexts]"
+
+    def update_weights(self, positive: bool, feedback_strength: float = 0.01):
+        adjustment = feedback_strength if positive else -feedback_strength / 2
+        self.model["learning_rate"] = max(0.0001, self.model["learning_rate"] + adjustment)
+        logging.info(f"Updated learning rate to {self.model['learning_rate']}")
+
+# ------------------------------
+# Group 5: LLMTrainer (LLM Training Protocol Integration)
+# ------------------------------
+
+class LLMTrainer:
+    """
+    LLMTrainer module incorporates LLM training protocols.
+    It uses stored interactions (or any text file) to fine-tune a GPT-2 model.
+    """
+    def __init__(self, training_file: str, model_name: str = "gpt2", output_dir: str = "./llm_output"):
+        self.training_file = training_file
+        self.model_name = model_name
+        self.output_dir = output_dir
+        self.tokenizer = GPT2Tokenizer.from_pretrained(model_name)
+        self.model = GPT2LMHeadModel.from_pretrained(model_name)
+        self.training_args = TrainingArguments(
+            output_dir=output_dir,
+            overwrite_output_dir=True,
+            num_train_epochs=1,              # For demonstration; increase as needed
+            per_device_train_batch_size=2,
+            save_steps=500,
+            save_total_limit=2,
+            prediction_loss_only=True,
+        )
+
+    def prepare_dataset(self):
+        dataset = TextDataset(
+            tokenizer=self.tokenizer,
+            file_path=self.training_file,
+            block_size=128
+        )
+        data_collator = DataCollatorForLanguageModeling(
+            tokenizer=self.tokenizer,
+            mlm=False,
+        )
+        return dataset, data_collator
+
+    def train(self):
+        dataset, data_collator = self.prepare_dataset()
+        trainer = Trainer(
+            model=self.model,
+            args=self.training_args,
+            data_collator=data_collator,
+            train_dataset=dataset
+        )
+        trainer.train()
+        trainer.save_model(self.output_dir)
+        logging.info(f"LLM Training complete. Model saved to {self.output_dir}")
+
+# ------------------------------
+# Group 1: Brain (Main Input/Output Handler)
+# ------------------------------
+
+class Brain:
+    """
+    The main brain that handles user input/output.
+    Integrates Memory, NeuralNetwork, Messenger, and LLMTrainer.
+    """
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config
+        self.memory = Memory(config.get("memory", {}))
+        self.messenger = Messenger(config.get("messenger", {}))
+        self.network = NeuralNetwork(self.memory)
+        # Initialize LLMTrainer using the interactions file from Messenger as training data.
+        self.llm_trainer = LLMTrainer(str(self.messenger.interactions_file), model_name="gpt2", output_dir="./llm_output")
+
+    async def process_input_async(self, input_str: str) -> str:
+        try:
+            # Log initial input
+            await asyncio.to_thread(self.messenger.log_interaction, input_str, "")
+            
+            # Basic processing: adjust based on input length
+            processed = self._basic_process(input_str)
+            
+            # Refine output using the neural network (internal talking)
+            refined = await asyncio.to_thread(self.network.refine_output, processed)
+            
+            # Store the refined output in memory
+            memory_key = await asyncio.to_thread(self.memory.store, refined)
+            
+            # Log the final interaction
+            await asyncio.to_thread(self.messenger.log_interaction, input_str, refined)
+            
+            return refined
+        except Exception as e:
+            logging.error(f"Processing error: {str(e)}")
+            return "System error occurred"
+
+    def process_input(self, input_str: str) -> str:
+        return asyncio.run(self.process_input_async(input_str))
+
+    def submit_feedback(self, memory_key: str, positive: bool):
+        """
+        Submit user feedback that propagates to Memory, Messenger, and NeuralNetwork.
+        """
+        self.memory.feedback_memory(memory_key, positive)
+        self.messenger.log_feedback(memory_key, positive)
+        self.network.update_weights(positive)
+        logging.info(f"Feedback submitted for key {memory_key}: {'positive' if positive else 'negative'}")
+
+    def trigger_llm_training(self):
+        """
+        Trigger the LLM training protocol using stored interactions.
+        """
+        logging.info("Starting LLM training protocol...")
+        self.llm_trainer.train()
+
+    def _basic_process(self, input_str: str) -> str:
+        # Basic validation and processing
+        if not isinstance(input_str, str) or len(input_str.strip()) == 0:
+            return "Invalid input"
+        if len(input_str) > 100:
+            context = self.memory.get_context(input_str)
+            return f"{input_str} [Context: {context}]"
+        return input_str.capitalize()
+
+# ------------------------------
+# New Top-System: LLMInterface and TopSystem
+# ------------------------------
+
+class LLMInterface:
+    """
+    Interface for communicating with external LLM emulators.
+    Uses a transformers text-generation pipeline.
+    """
+    def __init__(self, model_name: str = "gpt2"):
+        self.generator = pipeline("text-generation", model=model_name)
+
+    def ask(self, prompt: str, max_length: int = 100) -> str:
+        result = self.generator(prompt, max_length=max_length, num_return_sequences=1)
+        return result[0]['generated_text']
+
+class TopSystem:
+    """
+    Top system that integrates the Brain with external LLM emulators.
+    Enables the Brain to converse with LLMs for self-learning and training.
+    """
+    def __init__(self, brain: Brain, llm_interface: LLMInterface):
+        self.brain = brain
+        self.llm_interface = llm_interface
+
+    def converse(self, input_str: str) -> str:
+        # The Brain processes the input.
+        brain_response = self.brain.process_input(input_str)
+        # Query the external LLM emulator.
+        external_response = self.llm_interface.ask(input_str)
+        # Combine both responses for richer context.
+        combined_response = (
+            f"Brain Response:\n{brain_response}\n\n"
+            f"External LLM Response:\n{external_response}"
+        )
+        return combined_response
+
+    def train_self(self) -> str:
+        self.brain.trigger_llm_training()
+        return "Self-training protocol triggered on Brain."
+
+# ------------------------------
+# Example Usage
+# ------------------------------
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    config = {
+        "memory": {
+            "short_term_capacity": 200,
+            "persistence_file": "memory/storage.json"
+        },
+        "messenger": {
+            "data_dir": "data"
+        }
+    }
+    brain = Brain(config)
+    llm_interface = LLMInterface(model_name="gpt2")
+    top_system = TopSystem(brain, llm_interface)
+    
+    # Let the top system converse with the external LLM emulator.
+    prompt = "What is the meaning of life?"
+    conversation = top_system.converse(prompt)
+    print("Conversation:\n", conversation)
+    
+    # Optionally, trigger self-training.
+    training_status = top_system.train_self()
+    print(training_status)
